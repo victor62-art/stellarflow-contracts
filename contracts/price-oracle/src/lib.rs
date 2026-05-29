@@ -351,18 +351,32 @@ pub enum Error {
     ContractDestroyed = 20,
     /// Delegate assignment is invalid.
     InvalidDelegate = 21,
-    /// Governance action cannot execute: total votes cast are below the minimum quorum.
-    QuorumNotReached = 22,
-    /// Config rollback failed: no previous value has been backed up for this parameter.
-    NoPreviousConfig = 23,
-    /// Contract has not been initialized yet.
-    NotInitialized = 24,
-    /// Rate map entry exceeds the maximum allowed age (MAX_RATE_AGE_SECONDS).
-    ///
-    /// Raised by `get_price` and `get_last_price` when the stored timestamp is
-    /// older than `current_timestamp - MAX_RATE_AGE_SECONDS`, indicating the
-    /// relayer has not refreshed the price within the permitted window.
-    StaleRateData = 25,
+    /// No admin has been configured for this contract.
+    AdminNotSet = 22,
+    /// No pending admin transfer exists.
+    PendingAdminNotFound = 23,
+    /// Pending admin transfer timestamp is missing.
+    PendingAdminTimestampMissing = 24,
+    /// Caller is not the pending admin for the active transfer.
+    NotPendingAdmin = 25,
+    /// Admin transfer timelock has not expired yet.
+    AdminTimelockNotExpired = 26,
+    /// Contract is in emergency freeze state.
+    ContractFrozen = 27,
+    /// Caller is not the configured Community Council.
+    CouncilRequired = 28,
+    /// Caller is not a whitelisted price provider.
+    ProviderNotAuthorized = 29,
+    /// Price floor configuration is invalid.
+    InvalidPriceFloor = 30,
+    /// Price bounds configuration is invalid.
+    InvalidPriceBounds = 31,
+    /// Maximum deviation basis points configuration is invalid.
+    InvalidMaxDeviation = 32,
+    /// Normalized or aggregated price failed internal validation.
+    InvalidNormalizedPrice = 33,
+    /// Price normalization overflowed or divided by zero.
+    PriceMathOverflow = 34,
 }
 
 #[contract]
@@ -517,7 +531,7 @@ pub fn enforce_rate_map_max_age(env: &Env, current_time: u64, stored_timestamp: 
 fn acquire_lock(env: &Env) -> Result<(), Error> {
     let is_locked: bool = env
         .storage()
-        .instance()
+        .temporary()
         .get(&DataKey::IsLocked)
         .unwrap_or(false);
 
@@ -525,13 +539,13 @@ fn acquire_lock(env: &Env) -> Result<(), Error> {
         return Err(Error::ReentrancyDetected);
     }
 
-    env.storage().instance().set(&DataKey::IsLocked, &true);
+    env.storage().temporary().set(&DataKey::IsLocked, &true);
     Ok(())
 }
 
 /// Release the reentrancy lock for set_price.
 fn release_lock(env: &Env) {
-    env.storage().instance().set(&DataKey::IsLocked, &false);
+    env.storage().temporary().set(&DataKey::IsLocked, &false);
 }
 
 /// Contract version - must match Cargo.toml version
@@ -552,16 +566,16 @@ fn _set_tracked_assets(env: &Env, assets: &soroban_sdk::Vec<Symbol>) {
 
 /// Get the price buffer for a specific asset using a composite (Symbol, u64) key.
 ///
-/// Each asset's buffer is stored under `DataKey::PriceBufferByAsset(asset, ledger_sequence)`
-/// so a single-asset read never loads any other asset's buffer, eliminating the
-/// gas cost of deserialising the old `Map<Symbol, PriceBuffer>` on every call.
+/// Each asset's buffer is stored temporarily under
+/// `DataKey::PriceBufferByAsset(asset, ledger_sequence)` so a single-asset read
+/// never loads any other asset's buffer and old buffers can expire naturally.
 ///
 /// If no buffer exists for the current ledger sequence a fresh empty one is returned.
 fn get_price_buffer(env: &Env, asset: Symbol) -> PriceBuffer {
     let current_seq = env.ledger().sequence() as u64;
     let key = DataKey::PriceBufferByAsset(asset, current_seq);
     env.storage()
-        .persistent()
+        .temporary()
         .get(&key)
         .unwrap_or_else(|| PriceBuffer {
             entries: soroban_sdk::Vec::new(env),
@@ -573,19 +587,19 @@ fn get_price_buffer(env: &Env, asset: Symbol) -> PriceBuffer {
 
 /// Save the price buffer for a specific asset using a composite (Symbol, u64) key.
 ///
-/// Writes only the single slot for `(asset, ledger_sequence)` — no other asset's
-/// buffer is touched or loaded.
+/// Writes only the temporary slot for `(asset, ledger_sequence)` — no other
+/// asset's buffer is touched or loaded.
 fn set_price_buffer(env: &Env, asset: Symbol, buffer: &PriceBuffer) {
     let seq = buffer.ledger_sequence as u64;
     let key = DataKey::PriceBufferByAsset(asset, seq);
-    env.storage().persistent().set(&key, buffer);
+    env.storage().temporary().set(&key, buffer);
 }
 
 /// Clear the price buffer if it's from a previous ledger.
 ///
 /// With composite keys the buffer is already scoped to a specific ledger
 /// sequence, so staleness is implicit — a buffer from a prior ledger simply
-/// lives under a different key and is never returned by `get_price_buffer`.
+/// lives under a different temporary key until the network prunes it.
 /// This function resets the in-memory buffer when the caller holds a buffer
 /// whose `ledger_sequence` no longer matches the current ledger.
 fn clear_stale_buffer(env: &Env, _asset: Symbol, buffer: &mut PriceBuffer) {
@@ -637,7 +651,7 @@ fn _track_asset(env: &Env, asset: Symbol) {
 fn log_event(env: &Env, event_type: Symbol, asset: Symbol, price: i128) {
     let mut events: soroban_sdk::Vec<RecentEvent> = env
         .storage()
-        .instance()
+        .temporary()
         .get(&DataKey::RecentEvents)
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
 
@@ -655,7 +669,7 @@ fn log_event(env: &Env, event_type: Symbol, asset: Symbol, price: i128) {
     }
 
     env.storage()
-        .instance()
+        .temporary()
         .set(&DataKey::RecentEvents, &events);
 }
 
@@ -669,7 +683,7 @@ fn _log_admin_action(env: &Env, admin: &Address, action: AdminAction, details: O
     // Store the admin log entry - using a simple key for now
     // In production, you might want to store multiple entries in a vector
     env.storage()
-        .instance()
+        .temporary()
         .set(&DataKey::AdminUpdateTimestamp, &entry.timestamp);
 }
 
@@ -694,7 +708,7 @@ fn update_twap(env: &Env, asset: Symbol, price: i128, timestamp: u64) {
     let key = DataKey::Twap(asset);
     let mut twap_buffer: soroban_sdk::Vec<(u64, i128)> = env
         .storage()
-        .persistent()
+        .temporary()
         .get(&key)
         .unwrap_or_else(|| soroban_sdk::Vec::new(env));
 
@@ -704,7 +718,7 @@ fn update_twap(env: &Env, asset: Symbol, price: i128, timestamp: u64) {
         twap_buffer.pop_front();
     }
 
-    env.storage().persistent().set(&key, &twap_buffer);
+    env.storage().temporary().set(&key, &twap_buffer);
 }
 
 #[contractimpl]
@@ -931,7 +945,9 @@ impl PriceOracle {
 
     /// Return the current admin addresses.
     pub fn get_admin(env: Env) -> Address {
-        crate::auth::_get_admin(&env).get(0).expect("No admin set")
+        crate::auth::_get_admin(&env)
+            .get(0)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::AdminNotSet))
     }
 
     /// Returns true if the supplied address is one of the admin addresses.
@@ -965,22 +981,22 @@ impl PriceOracle {
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
-            .expect("No pending admin");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PendingAdminNotFound));
 
         if pending != new_admin {
-            panic!("Not pending admin");
+            panic_with_error!(&env, Error::NotPendingAdmin);
         }
 
         let timestamp: u64 = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdminTimestamp)
-            .expect("No pending admin timestamp");
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PendingAdminTimestampMissing));
 
         let now = env.ledger().timestamp();
 
         if now < timestamp.saturating_add(ADMIN_TIMELOCK) {
-            panic!("Timelock not expired");
+            panic_with_error!(&env, Error::AdminTimelockNotExpired);
         }
 
         //_log_admin_action(&env, &new_admin, AdminAction::TransferAdminAccepted, None);
@@ -988,7 +1004,7 @@ impl PriceOracle {
         crate::auth::_set_admin(&env, &admins);
 
         env.storage()
-            .instance()
+            .temporary()
             .set(&DataKey::AdminUpdateTimestamp, &now);
 
         env.storage().instance().remove(&DataKey::PendingAdmin);
@@ -1229,13 +1245,9 @@ impl PriceOracle {
             // Normalize the raw price to 9 fixed-point decimals on entry.
             let normalized = Self::normalize_price(&env, &asset, val);
 
-            // INVARIANT: normalization must never produce a non-positive price.
-            // A positive raw input scaled by a positive power of 10 must remain
-            // positive. If this fires, the normalization logic has a bug.
-            assert!(
-                normalized > 0,
-                "invariant violated: normalized price must be > 0"
-            );
+            if normalized <= 0 {
+                return Err(Error::InvalidNormalizedPrice);
+            }
 
             if let Err(err) = enforce_price_floor(&env, &asset, normalized) {
                 return Err(err);
@@ -1351,13 +1363,9 @@ impl PriceOracle {
         // Normalize the raw price to 9 fixed-point decimals on entry.
         let normalized = Self::normalize_price(&env, &asset, price);
 
-        // INVARIANT: normalization must never produce a non-positive price.
-        // A positive raw input scaled by a positive power of 10 must remain
-        // positive. If this fires, the normalization logic has a bug.
-        assert!(
-            normalized > 0,
-            "invariant violated: normalized price must be > 0"
-        );
+        if normalized <= 0 {
+            return Err(Error::InvalidNormalizedPrice);
+        }
 
         let now = env.ledger().timestamp();
         let price_data = PriceData {
@@ -1519,13 +1527,9 @@ impl PriceOracle {
         // Normalize the raw price to 9 fixed-point decimals on entry.
         let normalized = Self::normalize_price(&env, &asset, price);
 
-        // INVARIANT: normalization must never produce a non-positive price.
-        // A positive raw input scaled by a positive power of 10 must remain
-        // positive. If this fires, the normalization logic has a bug.
-        assert!(
-            normalized > 0,
-            "invariant violated: normalized price must be > 0"
-        );
+        if normalized <= 0 {
+            return Err(Error::InvalidNormalizedPrice);
+        }
 
         // Get the current buffer for this asset
         let mut buffer = get_price_buffer(&env, asset.clone());
@@ -1603,12 +1607,9 @@ impl PriceOracle {
         // Calculate the new median and store it as the canonical price
         let median_price = calculate_median_from_buffer(&env, &buffer).unwrap_or(normalized);
 
-        // INVARIANT: the median of a set of positive prices must itself be
-        // positive. If this fires, the median aggregation logic has a bug.
-        assert!(
-            median_price > 0,
-            "invariant violated: median_price must be > 0"
-        );
+        if median_price <= 0 {
+            return Err(Error::InvalidNormalizedPrice);
+        }
 
         // Also update the legacy PriceData for backward compatibility
         let mut prices: soroban_sdk::Map<Symbol, PriceData> = storage
@@ -1661,13 +1662,14 @@ impl PriceOracle {
         admin.require_auth();
         crate::auth::_require_authorized(&env, &admin);
 
-        assert!(price_floor > 0, "price_floor must be positive");
+        if price_floor <= 0 {
+            panic_with_error!(&env, Error::InvalidPriceFloor);
+        }
 
         if let Some(bounds) = Self::get_price_bounds(env.clone(), asset.clone()) {
-            assert!(
-                price_floor <= bounds.max_price,
-                "price_floor must be <= max_price"
-            );
+            if price_floor > bounds.max_price {
+                panic_with_error!(&env, Error::InvalidPriceFloor);
+            }
         }
 
         // Backup current floor before overwriting (issue #281).
@@ -1727,10 +1729,13 @@ impl PriceOracle {
         admin.require_auth();
         crate::auth::_require_authorized(&env, &admin);
 
-        assert!(min_price > 0 && max_price > 0, "bounds must be positive");
-        assert!(min_price <= max_price, "min_price must be <= max_price");
+        if min_price <= 0 || max_price <= 0 || min_price > max_price {
+            panic_with_error!(&env, Error::InvalidPriceBounds);
+        }
         if let Some(price_floor) = read_price_floor(&env, &asset) {
-            assert!(price_floor <= max_price, "price_floor must be <= max_price");
+            if price_floor > max_price {
+                panic_with_error!(&env, Error::InvalidPriceBounds);
+            }
         }
 
         // Backup current bounds before overwriting (issue #281).
@@ -1793,11 +1798,9 @@ impl PriceOracle {
         admin.require_auth();
         crate::auth::_require_authorized(&env, &admin);
 
-        assert!(max_deviation_bps > 0, "max_deviation_bps must be positive");
-        assert!(
-            max_deviation_bps <= 10_000,
-            "max_deviation_bps must be <= 10000"
-        );
+        if max_deviation_bps <= 0 || max_deviation_bps > 10_000 {
+            panic_with_error!(&env, Error::InvalidMaxDeviation);
+        }
 
         // Backup current value before overwriting (issue #281).
         if let Some(existing) = env
@@ -1867,7 +1870,7 @@ impl PriceOracle {
     pub fn get_last_n_events(env: Env, n: u32) -> soroban_sdk::Vec<RecentEvent> {
         let events: soroban_sdk::Vec<RecentEvent> = env
             .storage()
-            .instance()
+            .temporary()
             .get(&DataKey::RecentEvents)
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
 
@@ -2083,9 +2086,9 @@ impl PriceOracle {
             .instance()
             .remove(&DataKey::PendingAdminTimestamp);
         env.storage()
-            .instance()
+            .temporary()
             .remove(&DataKey::AdminUpdateTimestamp);
-        env.storage().instance().remove(&DataKey::RecentEvents);
+        env.storage().temporary().remove(&DataKey::RecentEvents);
         env.storage().instance().remove(&DataKey::Initialized);
         crate::auth::_remove_paused(&env);
 
@@ -2439,9 +2442,9 @@ impl PriceOracle {
                     .instance()
                     .remove(&DataKey::PendingAdminTimestamp);
                 env.storage()
-                    .instance()
+                    .temporary()
                     .remove(&DataKey::AdminUpdateTimestamp);
-                env.storage().instance().remove(&DataKey::RecentEvents);
+                env.storage().temporary().remove(&DataKey::RecentEvents);
                 env.storage().instance().remove(&DataKey::Initialized);
                 crate::auth::_remove_paused(&env);
 
@@ -2660,7 +2663,7 @@ impl PriceOracle {
     /// Get the Time-Weighted Average Price (TWAP) for a specific asset.
     pub fn get_twap(env: Env, asset: Symbol) -> Option<i128> {
         let key = DataKey::Twap(asset);
-        let twap_buffer: soroban_sdk::Vec<(u64, i128)> = env.storage().persistent().get(&key)?;
+        let twap_buffer: soroban_sdk::Vec<(u64, i128)> = env.storage().temporary().get(&key)?;
 
         let len = twap_buffer.len();
         if len == 0 {

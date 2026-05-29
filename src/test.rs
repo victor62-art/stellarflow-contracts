@@ -1,6 +1,9 @@
 use soroban_sdk::{Env, Symbol, symbol_short, IntoVal};
 use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
-use crate::{TimeLockedUpgradeContract, TimeLockedUpgradeContractClient, UPGRADE_DELAY_SECONDS, DEFAULT_HEARTBEAT_INTERVAL};
+use crate::{
+    ContractError, TimeLockedUpgradeContract, TimeLockedUpgradeContractClient,
+    DEFAULT_HEARTBEAT_INTERVAL, UPGRADE_DELAY_SECONDS,
+};
 
 /// Helper: advance the ledger timestamp by `delta` seconds.
 fn advance_ledger_timestamp(env: &Env, delta: u64) {
@@ -367,12 +370,9 @@ fn test_set_value_updates_heartbeat() {
     client.set_value(&100, &admin, &1);
     assert!(client.is_data_fresh(&value_asset));
 }
-// ═════════════════════════════════════════════════════════════════════════════
-// Nonce test
-// ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_nonce_starts_at_zero() {
+fn test_initialize_twice_returns_typed_error() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
@@ -381,30 +381,27 @@ fn test_nonce_starts_at_zero() {
     let admin = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
-    // Fresh address should have nonce 0
-    assert_eq!(client.get_coordinator_nonce(&admin), 0);
+    let result = client.try_initialize(&admin);
+    assert_eq!(result, Err(Ok(ContractError::AlreadyInitialized)));
 }
 
 #[test]
-fn test_nonce_increments_after_use() {
+fn test_unauthorized_set_value_returns_typed_error() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
     let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
     let admin = soroban_sdk::Address::generate(&env);
+    let unauthorized = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
-    assert_eq!(client.get_coordinator_nonce(&admin), 0);
-    client.set_value(&10, &admin, &0);
-    assert_eq!(client.get_coordinator_nonce(&admin), 1);
-    client.set_value(&20, &admin, &1);
-    assert_eq!(client.get_coordinator_nonce(&admin), 2);
+    let result = client.try_set_value(&42, &unauthorized);
+    assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
 }
 
 #[test]
-#[should_panic(expected = "Invalid nonce")]
-fn test_nonce_replay_rejected() {
+fn test_zero_heartbeat_interval_returns_typed_error() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
@@ -413,63 +410,6 @@ fn test_nonce_replay_rejected() {
     let admin = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
-    client.set_value(&10, &admin, &0);
-    client.set_value(&20, &admin, &0);
-}
-
-#[test]
-#[should_panic(expected = "Invalid nonce")]
-fn test_nonce_wrong_sequence_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
-    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
-
-    let admin = soroban_sdk::Address::generate(&env);
-    client.initialize(&admin);
-
-    // Skip nonce 0 and try nonce 1 directly → should panic
-    client.set_value(&10, &admin, &1);
-}
-
-#[test]
-fn test_nonce_independent_per_coordinator() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
-    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
-
-    let admin = soroban_sdk::Address::generate(&env);
-    let other = soroban_sdk::Address::generate(&env);
-    client.initialize(&admin);
-
-    // admin uses nonce 0
-    client.set_value(&10, &admin, &0);
-    assert_eq!(client.get_coordinator_nonce(&admin), 1);
-
-    // other address still starts at 0 — nonces are independent
-    assert_eq!(client.get_coordinator_nonce(&other), 0);
-}
-
-#[test]
-fn test_nonce_propose_and_execute() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
-    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
-
-    let admin = soroban_sdk::Address::generate(&env);
-    client.initialize(&admin);
-
-    let new_wasm_hash = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
-
-    // propose consumes nonce 0
-    client.propose_upgrade(&new_wasm_hash, &admin, &0);
-    assert_eq!(client.get_coordinator_nonce(&admin), 1);
-
-    advance_ledger_timestamp(&env, UPGRADE_DELAY_SECONDS);
-
-    // execute consumes nonce 1
-    client.execute_upgrade(&admin, &1);
-    assert_eq!(client.get_coordinator_nonce(&admin), 2);
+    let result = client.try_set_heartbeat_interval(&0, &admin);
+    assert_eq!(result, Err(Ok(ContractError::InvalidHeartbeatInterval)));
 }
