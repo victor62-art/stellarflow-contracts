@@ -8,6 +8,9 @@ use soroban_sdk::{
 const DATA_KEY: Symbol = Symbol::short("DATA");
 const PENDING_UPGRADE_KEY: Symbol = Symbol::short("PENDING");
 const UPGRADE_DELAY_SECONDS: u64 = 48 * 60 * 60; // 48 hours in seconds
+// Dedicated initialization flag — separate from DATA_KEY so the guard survives
+// partial-write failures and is not sensitive to data structure changes.
+const INIT_FLAG_KEY: Symbol = Symbol::short("INITD");
 
 // ── Heartbeat keys (Issue #188) ──────────────────────────────────────────────
 /// Per-asset last-update timestamps: Map<Symbol, u64>
@@ -53,14 +56,14 @@ impl TimeLockedUpgradeContract {
         if env.storage().instance().has(&DATA_KEY) {
             return Err(ContractError::AlreadyInitialized);
         }
-        
+
         admin.require_auth();
-        
+
         let data = ContractData {
             admin: admin.clone(),
             value: 0,
         };
-        
+
         env.storage().instance().set(&DATA_KEY, &data);
         Ok(())
     }
@@ -88,7 +91,7 @@ impl TimeLockedUpgradeContract {
         }
         
         proposer.require_auth();
-        
+        consume_nonce(&env, &proposer, nonce);
         let current_time = env.ledger().timestamp();
         
         let pending_upgrade = PendingUpgrade {
@@ -111,7 +114,7 @@ impl TimeLockedUpgradeContract {
         }
         
         executor.require_auth();
-        
+        consume_nonce(&env, &executor, nonce);
         let pending_upgrade: PendingUpgrade = env
             .storage()
             .instance()
@@ -188,7 +191,7 @@ impl TimeLockedUpgradeContract {
         }
         
         setter.require_auth();
-        
+        consume_nonce(&env, &setter, nonce);
         data.value = value;
         env.storage().instance().set(&DATA_KEY, &data);
 
@@ -288,6 +291,9 @@ impl TimeLockedUpgradeContract {
     /// if none has been explicitly set.
     pub fn get_heartbeat_interval(env: Env) -> u64 {
         Self::_get_interval(&env)
+    }
+    pub fn get_coordinator_nonce(env: Env, coordinator: Address) -> u64 {
+        get_nonce(&env, &coordinator)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
