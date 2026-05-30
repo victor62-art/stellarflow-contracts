@@ -13,6 +13,11 @@ use crate::types::{
 const ADMIN_TIMELOCK: u64 = 86_400;
 const MAX_CLEAR_ASSETS: u32 = 20;
 
+/// Maximum number of price entries allowed in the buffer for median calculation.
+/// This threshold prevents CPU budget exhaustion during high-volatility spikes
+/// when many providers submit prices simultaneously.
+const MAX_MEDIAN_ENTRIES: u32 = 11;
+
 /// A clean, gas-optimized interface for other Soroban contracts to fetch prices from StellarFlow.
 ///
 /// The generated client from this trait is the intended cross-contract entrypoint for downstream
@@ -666,6 +671,65 @@ fn has_provider_submitted(buffer: &PriceBuffer, provider: &Address) -> bool {
         .entries
         .iter()
         .any(|entry| entry.provider == *provider)
+}
+
+/// Truncate buffer entries to MAX_MEDIAN_ENTRIES, keeping highest-weight providers.
+/// This prevents CPU budget exhaustion during high-volatility spikes when many
+/// providers submit prices simultaneously.
+fn truncate_buffer_by_weight(env: &Env, buffer: &mut PriceBuffer) {
+    let entry_count = buffer.entries.len();
+    
+    // No truncation needed if we're under the limit
+    if entry_count <= MAX_MEDIAN_ENTRIES {
+        return;
+    }
+
+    // Build a vector of (index, weight) pairs
+    let mut weighted_entries = soroban_sdk::Vec::new(env);
+    for i in 0..entry_count {
+        if let Some(entry) = buffer.entries.get(i) {
+            let weight = crate::auth::_get_provider_weight(env, &entry.provider);
+            weighted_entries.push_back((i, weight));
+        }
+    }
+
+    // Sort by weight descending using insertion sort (higher weight = higher priority)
+    let len = weighted_entries.len();
+    for i in 1..len {
+        let mut j = i;
+        while j > 0 {
+            let (_, weight_a) = weighted_entries.get(j - 1).unwrap();
+            let (_, weight_b) = weighted_entries.get(j).unwrap();
+            // Sort descending: if previous weight is less than current, swap
+            if weight_a < weight_b {
+                let temp_a = weighted_entries.get(j - 1).unwrap();
+                let temp_b = weighted_entries.get(j).unwrap();
+                weighted_entries.set(j - 1, temp_b);
+                weighted_entries.set(j, temp_a);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Keep only the top MAX_MEDIAN_ENTRIES indices
+    let mut indices_to_keep = soroban_sdk::Vec::new(env);
+    for i in 0..MAX_MEDIAN_ENTRIES.min(len) {
+        if let Some((idx, _)) = weighted_entries.get(i) {
+            indices_to_keep.push_back(idx);
+        }
+    }
+
+    // Build new entries vector with only the selected indices
+    let mut new_entries = soroban_sdk::Vec::new(env);
+    for idx in indices_to_keep.iter() {
+        if let Some(entry) = buffer.entries.get(idx) {
+            new_entries.push_back(entry);
+        }
+    }
+
+    buffer.entries = new_entries;
 }
 
 /// Calculate the median price from the buffer entries.
@@ -1668,6 +1732,9 @@ impl PriceOracle {
         // Buffer decimals are always 9 after normalization.
         buffer.decimals = 9;
         buffer.ttl = ttl;
+
+        // Truncate buffer to MAX_MEDIAN_ENTRIES if needed, keeping highest-weight providers
+        truncate_buffer_by_weight(&env, &mut buffer);
 
         // Save the updated buffer
         set_price_buffer(&env, asset.clone(), &buffer);
